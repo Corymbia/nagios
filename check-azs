@@ -1,0 +1,229 @@
+#!/usr/bin/env python2
+# Software License Agreement (BSD License)
+#
+# Copyright (c) 2009-2011, Eucalyptus Systems, Inc.
+# All rights reserved.
+#
+# Redistribution and use of this software in source and binary forms, with or
+# without modification, are permitted provided that the following conditions
+# are met:
+#
+#   Redistributions of source code must retain the above
+#   copyright notice, this list of conditions and the
+#   following disclaimer.
+#
+#   Redistributions in binary form must reproduce the above
+#   copyright notice, this list of conditions and the
+#   following disclaimer in the documentation and/or other
+#   materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+#
+# Author: Andrew Hamilton ahamilton@eucalyptus.com
+#
+##############################################################################
+#
+# Script for checking the resources in an Availability Zone of
+# a Eucalyptus Cloud.
+#
+
+from __future__ import with_statement
+import boto
+from boto.ec2.connection import EC2Connection
+from optparse import OptionParser
+from urlparse import urlparse
+import os
+
+def parse_zones(zones):
+    """
+    Take the availability zone "verbose" results and parse them so that they are usable
+    """
+    zone_stats = []
+    index = 0
+    for zone in zones:
+        zone_name = zone.name.split(' ')
+        zone_info = zone.state.split(' ')
+
+        if len(zone_info) >= 13:
+            zone_name = zone_name[1]
+            zone_stats.append({'name': str(zone_name), 'available_instances': int(zone_info[0]), 'max_instances': int(zone_info[2])})
+
+    return zone_stats
+
+def parse_check_values(values):
+    """
+    Take the command line options for warning and critical and parse out the values into a dictionary
+    """
+    split_values = {}
+    vm_types = ['m1.small', 'c1.medium', 'm1.large', 'm1.xlarge', 'c1.xlarge']
+    if values != None:
+        value_list = values.split(',')
+        
+        for value in xrange(0, len(value_list)):
+            if value_list[value] == '':
+                split_values[vm_types[value]] = -1
+            else:
+                split_values[vm_types[value]] = value_list[value]
+
+    return split_values
+
+def check_counts(zone_stats, warning, critical):
+    """
+    Check the values in zone_stats against the warning and critical values. If we find a value that is
+    lower than a warning or critical value then change the alert value. Since CRITICAL is the highest 
+    value we will have if it is already set then do not change it. This function works on integers so is
+    used with "-i" is passed on the command line.
+    """
+    alert_value = 'OK'
+    alert_msg = ''
+
+    for vm_type in zone_stats:
+        if critical != {} and vm_type['available_instances'] <= int(critical[vm_type['name']]):
+            alert_value = 'CRITICAL'
+        elif warning != {} and alert_value != 'CRITICAL'and vm_type['available_instances'] <= int(warning[vm_type['name']]): 
+            alert_value = 'WARNING'
+
+        alert_msg += "%s (%s/%s) " % (vm_type['name'], vm_type['available_instances'], vm_type['max_instances'])
+
+    return alert_value, alert_msg
+
+def check_percentages(zone_stats, warning, critical):
+    """
+    Check the values in zone_stats against the warning and critical values. If we find a value that is
+    lower than a warning or critical value then change the alert value. Since CRITICAL is the highest 
+    value we will have if it is already set then do not change it. This function works on percentages.
+    """
+    alert_value = 'OK'
+    alert_msg = ''
+
+    for vm_type in zone_stats:
+        available_percent = float(vm_type['available_instances']) / float(vm_type['max_instances'])
+
+        if critical != {} and available_percent <= float(critical[vm_type['name']]):
+            alert_value = 'CRITICAL'
+        elif warning != {} and available_percent <= float(warning[vm_type['name']]) and alert_value != 'CRITICAL':
+            alert_value = 'WARNING'
+
+        alert_msg += "%s (%s/%s = %s%%) " % (vm_type['name'], vm_type['available_instances'], vm_type['max_instances'], str(int(available_percent * 100)))
+
+    return alert_value, alert_msg
+
+def output_msg(alert_value, alert_msg):
+    """
+    Print out the message that may be displayed in the Nagios UI.
+    """
+    print "EUCA_AZS %s - %s" % (alert_value, alert_msg)
+
+def get_credentials(creds):
+    """
+    Get the admin credentials either in /etc/euca/eucarc or supplied with the -a option.
+    """
+    access_key = ''
+    secret_key = ''
+    eucalyptus_host = ''
+    eucalyptus_port = ''
+
+    with open(creds) as file:
+        for line in file:
+            if "EC2_URL" in line:
+                url = line.split('=')[1]
+                parsed_url = urlparse(url)
+
+                eucalyptus_host = parsed_url.hostname
+                eucalyptus_port = parsed_url.port
+
+            if "export EC2_ACCESS_KEY" in line:
+                access_key = line.split('\'')[1]
+
+            if "export EC2_SECRET_KEY" in line:
+                secret_key = line.split('\'')[1]
+
+    return access_key, secret_key, eucalyptus_host, eucalyptus_port
+
+def main():
+    access_key = ''
+    secret_key = ''
+    eucalyptus_host = ''
+    eucalyptus_port = ''
+    creds = "/etc/euca/eucarc"
+    
+    # Don't touch! I mean it!
+    debug_level = 0
+    euca_api_version = "2009-11-30"
+
+    parser = OptionParser()
+    parser.add_option("-w", "--warning", dest="warning",
+                      help="percentage of remaining vmtypes entered in a comma \
+                      separated list signifying the following values, \
+                      \"m1.small,c1.medium,m1.large,m1.xlarge,c1.xlarge\". A value of -1 \
+                      may be used to have that VM type ignored")
+    parser.add_option("-c", "--critical", dest="critical",
+                      help="percentage of remaining vmtypes entered in a comma \
+                      separated list signifying the following values, \
+                      \"m1.small,c1.medium,m1.large,m1.xlarge,c1.xlarge\". A value of -1 \
+                      may be used to have that VM type ignored")
+    parser.add_option("-i", "--counts", dest="use_count", action="store_true",
+                      default=False, help="Use AZ counts when determining if there is \
+                      an issue. If a value is not given here then percentages will be used.")
+    parser.add_option("-a", "--admin-credentials", dest="creds",
+                      help="location of account credentials to be used. Defaults to /etc/euca/eucarc")
+
+    (options, args) = parser.parse_args()
+    
+    warning = parse_check_values(options.warning)
+    critical = parse_check_values(options.critical)
+
+    if options.creds != None:
+        creds = options.creds
+
+    if not os.path.exists(creds):
+        alert_value = "UNKNOWN"
+        alert_msg = "Error opening credentials file! Please make sure %s exists." % (creds)
+        output_msg(alert_value, alert_msg)
+        exit(3)
+
+    if access_key == '':
+        (access_key, secret_key, eucalyptus_host, eucalyptus_port) = get_credentials(creds)
+
+    # Might want to add a try / except here so that we can produce a UNKNOWN value that will be
+    # understood if the cloud cannot be reached.
+    region = boto.ec2.regioninfo.RegionInfo(name="eucalyptus", endpoint=eucalyptus_host)
+    conn = EC2Connection(aws_access_key_id=access_key, aws_secret_access_key=secret_key, host=eucalyptus_host, port=eucalyptus_port,
+                         path="/services/Eucalyptus", debug=debug_level, api_version=euca_api_version, region=region)
+
+    zones = conn.get_all_zones(zones=["verbose"])
+
+    zone_stats = parse_zones(zones)
+    
+    if zone_stats != {}:
+        if (options.use_count):
+            (alert_value, alert_msg) = check_counts(zone_stats, warning, critical)
+        else:
+            (alert_value, alert_msg) = check_percentages(zone_stats, warning, critical) 
+    else:
+        alert_value = "UNKNOWN"
+        alert_msg = "Error getting AZ stats. Are you sure you're using administrator credentials for the eucalyptus account?"
+
+    output_msg(alert_value, alert_msg)
+
+    if alert_value == 'UNKNOWN':
+        exit(3)
+    elif alert_value == 'CRITICAL':
+        exit(2)
+    elif alert_value == 'WARNING':
+        exit(1)
+    else:
+        exit(0)
+
+if __name__ == "__main__":
+    main()
